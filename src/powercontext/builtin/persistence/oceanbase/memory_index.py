@@ -457,6 +457,7 @@ class OceanBaseMemoryVectorIndex:
                     )
                 ).mappings()
             )
+            print("HYBRID_CHANNEL_ROWS", [dict(row) for row in rows])
             return MemorySearchChannels(
                 fts=memory_channel_hits((row for row in rows if row["channel"] == "fts"), request.memories),
                 vector=memory_channel_hits((row for row in rows if row["channel"] == "vector"), request.memories),
