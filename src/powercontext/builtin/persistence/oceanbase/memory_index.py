@@ -99,7 +99,7 @@ LIMIT :candidate_limit
 """
 
 _OCEANBASE_HYBRID_SEARCH_SQL = """
-SELECT memory_artifact_id, head_revision, entry_id, entry_version_id, text, channel, relevance
+SELECT memory_artifact_id, head_revision, entry_id, entry_version_id, text, channel, distance
 FROM (
     SELECT
         h.memory_artifact_id,
@@ -108,7 +108,7 @@ FROM (
         h.entry_version_id,
         v.text,
         'fts' AS channel,
-        MATCH(h.searchable_text) AGAINST (:analyzed_query) AS relevance
+        MATCH(h.searchable_text) AGAINST (:analyzed_query) AS distance
     FROM pc_memory_entry_heads AS h
     JOIN pc_memory_entry_versions AS v
       ON v.scope_id = h.scope_id
@@ -117,11 +117,11 @@ FROM (
     WHERE h.scope_id = :scope_id
       AND h.memory_artifact_id IN :memory_artifact_ids
       AND MATCH(h.searchable_text) AGAINST (:analyzed_query)
-    ORDER BY relevance DESC, h.memory_artifact_id, h.entry_id, h.entry_version_id
+    ORDER BY distance DESC, h.memory_artifact_id, h.entry_id, h.entry_version_id
     LIMIT :candidate_limit
 ) AS fts_candidates
 UNION ALL
-SELECT memory_artifact_id, head_revision, entry_id, entry_version_id, text, channel, relevance
+SELECT memory_artifact_id, head_revision, entry_id, entry_version_id, text, channel, distance
 FROM (
     SELECT
         m.memory_artifact_id,
@@ -130,7 +130,7 @@ FROM (
         m.entry_version_id,
         v.text,
         'vector' AS channel,
-        l2_distance(m.embedding, :query_vector) AS relevance
+        l2_distance(m.embedding, :query_vector) AS distance
     FROM pc_memory_vector_entries AS m
     JOIN pc_memory_entry_versions AS v
       ON v.scope_id = m.scope_id
