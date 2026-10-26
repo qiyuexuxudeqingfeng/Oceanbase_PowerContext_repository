@@ -1,0 +1,59 @@
+name: Competition selftest
+
+on:
+  workflow_dispatch:
+    inputs:
+      test:
+        description: Public test target to run
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+          - test-csv
+          - test-pi
+          - test-pdf
+          - test-rerank
+          - test-incremental
+          - test-count-trigger
+          - test-embedding
+          - test-lifecycle
+          - test-evidence
+          - test-hybrid
+  push:
+    paths:
+      - "src/**"
+      - "competition/**"
+      - ".github/workflows/competition-selftest.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: competition-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12 and uv
+        uses: ./.github/actions/setup-python-env
+        with:
+          python-version: "3.12"
+
+      - name: Install public test dependencies
+        run: make -C competition install
+
+      - name: Check frozen baseline
+        run: make -C competition check-baseline
+
+      - name: Run public tests
+        run: make -C competition "${{ inputs.test || 'test' }}"

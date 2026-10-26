@@ -99,6 +99,18 @@ class ArtifactProcessingPendingProvider(Protocol):
         """Return the next keyset position, or None when this pass is complete."""
         ...
 
+    async def reconcile_count(
+        self,
+        threshold: int,
+        after_scope_id: str | None,
+        limit: int,
+        *,
+        excluded: frozenset[str],
+        fence: ArtifactProcessingFence,
+    ) -> tuple[tuple[str, ...], str | None]:
+        """Accept scopes whose journal watermark reaches the count threshold."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactProcessingBinding:
@@ -110,6 +122,7 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    source_count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -118,7 +131,7 @@ class ArtifactProcessingBinding:
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         if not self.binding_name or self.binding_name != self.binding_name.strip():
             raise ValueError("binding_name must be nonempty and trimmed")  # noqa: TRY003
         if re.fullmatch(r"[a-z][a-z0-9-]*", self.artifact_family) is None:
@@ -131,6 +144,10 @@ class ArtifactProcessingBinding:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int or self.source_count_threshold < 1
+        ):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
             if self.automatic_processing_interval.total_seconds() <= 0:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
@@ -401,6 +418,8 @@ class _FamilyState:
     discovery_pending: bool = True
     next_schedule_at: float | None = None
     next_discovery_at: float = 0.0
+    count_after: str | None = None
+    next_count_at: float = 0.0
     automatic_next: bool = False
     overflow_not_before: float = 0.0
     degraded: bool = False
@@ -620,10 +639,20 @@ class ArtifactProcessingSupervisor:
                 and self._fresh_capacity(state) > 0
                 and now >= max(state.next_discovery_at, state.overflow_not_before)
             )
-            if discoverable:
+            count_due = (
+                state.binding.source_count_threshold is not None
+                and state.binding.pending_provider is not None
+                and len(state.running) < state.binding.max_workers
+                and self._fresh_capacity(state) > 0
+                and now >= max(state.next_count_at, state.overflow_not_before)
+            )
+            if discoverable or count_due:
                 try:
                     async with asyncio.timeout(_DISCOVERY_TIMEOUT_SECONDS):
-                        await self._discover(state)
+                        if discoverable:
+                            await self._discover(state)
+                        if count_due:
+                            await self._discover_count_threshold(state)
                     state.degraded = False
                 except ArtifactProcessingLeadershipLostError:
                     raise
@@ -656,6 +685,28 @@ class ArtifactProcessingSupervisor:
         else:
             await self._discover_requested(state)
             await self._discover_automatic(state)
+
+    async def _discover_count_threshold(self, state: _FamilyState) -> None:
+        binding = state.binding
+        threshold = binding.source_count_threshold
+        provider = binding.pending_provider
+        capacity = self._fresh_capacity(state)
+        if threshold is None or provider is None or capacity <= 0:
+            return
+        state.next_count_at = asyncio.get_running_loop().time() + self._tick
+        admitted, after = await provider.reconcile_count(
+            threshold,
+            state.count_after,
+            min(capacity, _DISCOVERY_PAGE_SIZE),
+            excluded=frozenset(state.queued | set(state.running) | set(state.retries)),
+            fence=self._require_current_fence(),
+        )
+        state.count_after = after
+        state.next_count_at = asyncio.get_running_loop().time() + (
+            self._tick if after is None else _DISCOVERY_PAGE_DELAY_SECONDS
+        )
+        for scope in admitted:
+            self._enqueue(state, scope)
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
@@ -1060,6 +1111,8 @@ class ArtifactProcessingSupervisor:
             state.requested_after = state.scan_after = state.scan_generation = 0
             state.scan_in_progress = False
             state.discovery_pending = True
+            state.count_after = None
+            state.next_count_at = 0.0
 
     async def _reap_unconfirmed_exits(self) -> None:
         for handle in tuple(self._unreaped):
@@ -1091,6 +1144,8 @@ class ArtifactProcessingSupervisor:
             if state.overflow_not_before > now:
                 deadlines.append(state.overflow_not_before)
                 continue
+            if state.binding.source_count_threshold is not None:
+                deadlines.append(max(now, state.next_count_at))
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:

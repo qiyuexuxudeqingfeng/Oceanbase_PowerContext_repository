@@ -74,3 +74,37 @@ class SourceProcessingPendingProvider:
                 if intent is None or intent.dirty_generation == intent.clean_generation:
                     await intents.mark_dirty(connection, scope, self._binding)
         return str(rows[-1][0]) if len(rows) == limit else None
+
+    async def reconcile_count(
+        self,
+        threshold: int,
+        after_scope_id: str | None,
+        limit: int,
+        *,
+        excluded: frozenset[str],
+        fence: ArtifactProcessingFence,
+    ) -> tuple[tuple[str, ...], str | None]:
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        statement = select(heads.c.scope_id, heads.c.position).order_by(heads.c.scope_id).limit(limit)
+        if after_scope_id is not None:
+            statement = statement.where(heads.c.scope_id > after_scope_id)
+        admitted: list[str] = []
+        async with self._database.transaction() as connection:
+            await ArtifactProcessingLeaseRepository().require_fence(connection, fence)
+            rows = (await connection.execute(statement)).all()
+            intents = ArtifactProcessingIntentRepository()
+            cursors = SourceCursorRepository()
+            for scope, high in rows:
+                if scope in excluded:
+                    continue
+                intent = await intents.load(connection, scope, self._binding, for_update=True)
+                if intent is not None and intent.requested_generation > intent.handled_generation:
+                    continue
+                cursor = await cursors.load(connection, scope, self._binding)
+                position = 0 if cursor is None else cursor.cursor.sequence
+                if int(high) - position < threshold:
+                    continue
+                await intents.request(connection, scope, self._binding)
+                admitted.append(scope)
+        next_scope = str(rows[-1][0]) if len(rows) == limit else None
+        return tuple(admitted), next_scope
