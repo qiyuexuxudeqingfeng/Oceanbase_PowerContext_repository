@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import math
 import re
 from urllib.parse import quote
 
@@ -84,6 +83,10 @@ _QUESTION_STOP_WORDS = frozenset([
     "with",
     "within",
 ])
+
+_PROBE_GROUP_SIZE = 2
+_PROBE_TERM_CAP = 24
+_PROBE_CANDIDATE_LIMIT = 80
 
 
 class PDFDocumentInput(BaseModel):
@@ -213,54 +216,24 @@ def _citation(hit: MemoryHit) -> MemoryCitation:
     )
 
 
-def _query_terms(question: str) -> tuple[str, ...]:
-    return tuple(
-        dict.fromkeys(term for term in analyze_fts_query(question).split() if term not in _QUESTION_STOP_WORDS)
-    )
+def _probe_queries(question: str, size: int = _PROBE_GROUP_SIZE, cap: int = _PROBE_TERM_CAP) -> tuple[str, ...]:
+    """Split the question into short lexical probes.
 
-
-def _entity_terms(question: str) -> tuple[str, ...]:
-    """Return the question's capitalised spans and numbers.
-
-    Financial questions name the reporting entity, the fiscal year and the metric;
-    the evidence page repeats those tokens verbatim, so searching them alone keeps
-    pages that mention only a subset of the surrounding prose in the candidate pool.
+    A long question is rejected by the Memory API's coverage admission, and the page
+    that carries the answer often repeats only a couple of its tokens, so the whole
+    sentence is never used as a query. Short probes keep the admission floor low and
+    let the reciprocal-rank fusion below rank pages by how many probes they satisfy.
     """
 
-    entities: list[str] = []
-    for token in re.findall(r"[A-Za-z][A-Za-z'&.\-]*|\d[\d,\.]*%?", question):
-        stripped = token.rstrip(".,")
-        if not stripped:
-            continue
-        if stripped[0].isupper() or any(character.isdigit() for character in stripped):
-            entities.append(stripped.casefold())
-    return tuple(dict.fromkeys(entities))
-
-
-def _term_weights(documents: tuple[str, ...], terms: tuple[str, ...]) -> dict[str, float]:
-    """Approximate inverse document frequency over the candidate pool."""
-
-    if not terms:
-        return {}
-    frequencies: dict[str, int] = {}
-    for text in documents:
-        present = set(re.findall(r"[a-z]+|\d+", text.casefold()))
-        for term in present:
-            frequencies[term] = frequencies.get(term, 0) + 1
-    total = max(1, len(documents))
-    weights: dict[str, float] = {}
-    for term in terms:
-        document_frequency = frequencies.get(term, 0)
-        weights[term] = math.log(1.0 + total / max(1, document_frequency)) if document_frequency else 0.0
-    return weights
-
-
-def _weighted_coverage(terms: set[str], weights: dict[str, float], matched: set[str], /) -> float:
-    denominator = sum(weights.get(term, 0.0) for term in terms)
-    if denominator <= 0.0:
-        return 0.0
-    numerator = sum(weights.get(term, 0.0) for term in terms if term in matched)
-    return numerator / denominator
+    terms = [term for term in analyze_fts_query(question).split() if term not in _QUESTION_STOP_WORDS]
+    queries = [
+        " ".join(terms[start : start + size])
+        for start in range(0, min(len(terms), cap), size)
+        if terms[start : start + size]
+    ]
+    if not queries:
+        return (question.strip(),) if question.strip() else ()
+    return tuple(dict.fromkeys(queries))
 
 
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
@@ -268,36 +241,23 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         raise ValueError("limit must be a positive integer")
     if not question.strip():
         raise ValueError("question must not be blank")
-    query_terms = _query_terms(question)
-    entity_query = " ".join(_entity_terms(question))
-    queries = tuple(dict.fromkeys(query for query in (question, entity_query) if query.strip()))
-    candidates: dict[tuple[str, str, int, str, str], tuple[MemoryHit, float, int]] = {}
-    candidate_limit = min(400, max(100, limit * 10))
-    for query_index, query in enumerate(queries):
-        page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=candidate_limit))
-        weight = 1.0 if query_index == 0 else 0.8
+    queries = _probe_queries(question)
+    candidates: dict[tuple[str, str, int, str, str], tuple[MemoryHit, float]] = {}
+    for query in queries:
+        page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=_PROBE_CANDIDATE_LIMIT))
         for rank, hit in enumerate(page.hits, start=1):
             key = _hit_key(hit)
-            score = weight / (60 + rank)
+            score = 1.0 / (60 + rank)
             if key in candidates:
-                previous, previous_score, previous_rank = candidates[key]
-                candidates[key] = (previous, previous_score + score, min(previous_rank, rank))
+                previous, previous_score = candidates[key]
+                candidates[key] = (previous, previous_score + score)
             else:
-                candidates[key] = (hit, score, rank)
+                candidates[key] = (hit, score)
 
-    documents = tuple(hit.text for hit, _, _ in candidates.values())
-    weights = _term_weights(documents, query_terms)
-
-    def relevance(item) -> tuple[float, int]:
-        hit, reciprocal_rank, best_rank = item
-        matched = set(re.findall(r"[a-z]+|\d+", hit.text.casefold()))
-        coverage = _weighted_coverage(set(query_terms), weights, matched)
-        return -(reciprocal_rank * (1 + 3 * coverage)), best_rank
-
-    ordered = sorted(candidates.values(), key=relevance)
+    ordered = sorted(candidates.values(), key=lambda item: -item[1])
     citations: list[MemoryCitation] = []
     seen_sources: set[tuple[str, str]] = set()
-    for hit, _, _ in ordered:
+    for hit, _ in ordered:
         citation = _citation(hit)
         entry = await memory.get(GetMemoryEntryRequest(citation=citation))
         sources = {(source.source_type, source.source_id) for source in entry.entry.sources}
