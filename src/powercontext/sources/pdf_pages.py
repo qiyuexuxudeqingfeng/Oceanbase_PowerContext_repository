@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
 from urllib.parse import quote
 
@@ -233,6 +234,50 @@ def _query_terms(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return original, tuple(dict.fromkeys((*original, *additions)))
 
 
+def _entity_terms(question: str) -> tuple[str, ...]:
+    """Return the question's capitalised spans and numbers.
+
+    Financial questions name the reporting entity, the fiscal year and the metric;
+    the evidence page repeats those tokens verbatim, so searching them alone keeps
+    pages that mention only a subset of the surrounding prose in the candidate pool.
+    """
+
+    entities: list[str] = []
+    for token in re.findall(r"[A-Za-z][A-Za-z'&.\-]*|\d[\d,\.]*%?", question):
+        stripped = token.rstrip(".,")
+        if not stripped:
+            continue
+        if stripped[0].isupper() or any(character.isdigit() for character in stripped):
+            entities.append(stripped.casefold())
+    return tuple(dict.fromkeys(entities))
+
+
+def _term_weights(documents: tuple[str, ...], terms: tuple[str, ...]) -> dict[str, float]:
+    """Approximate inverse document frequency over the candidate pool."""
+
+    if not terms:
+        return {}
+    frequencies: dict[str, int] = {}
+    for text in documents:
+        present = set(re.findall(r"[a-z]+|\d+", text.casefold()))
+        for term in present:
+            frequencies[term] = frequencies.get(term, 0) + 1
+    total = max(1, len(documents))
+    weights: dict[str, float] = {}
+    for term in terms:
+        document_frequency = frequencies.get(term, 0)
+        weights[term] = math.log(1.0 + total / max(1, document_frequency)) if document_frequency else 0.0
+    return weights
+
+
+def _weighted_coverage(terms: set[str], weights: dict[str, float], matched: set[str], /) -> float:
+    denominator = sum(weights.get(term, 0.0) for term in terms)
+    if denominator <= 0.0:
+        return 0.0
+    numerator = sum(weights.get(term, 0.0) for term in terms if term in matched)
+    return numerator / denominator
+
+
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer")
@@ -240,9 +285,10 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         raise ValueError("question must not be blank")
     original_terms, expanded_terms = _query_terms(question)
     expanded_query = " ".join(expanded_terms)
-    queries = tuple(dict.fromkeys((question, expanded_query)))
+    entity_query = " ".join(_entity_terms(question))
+    queries = tuple(dict.fromkeys(query for query in (question, expanded_query, entity_query) if query.strip()))
     candidates: dict[tuple[str, str, int, str, str], tuple[MemoryHit, float, int]] = {}
-    candidate_limit = min(200, max(50, limit * 5))
+    candidate_limit = min(400, max(100, limit * 10))
     for query_index, query in enumerate(queries):
         page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=candidate_limit))
         weight = 1.0 if query_index == 0 else 0.8
@@ -255,12 +301,16 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
             else:
                 candidates[key] = (hit, score, rank)
 
+    documents = tuple(hit.text for hit, _, _ in candidates.values())
+    original_weights = _term_weights(documents, original_terms)
+    expanded_weights = _term_weights(documents, expanded_terms)
+
     def relevance(item) -> tuple[float, int]:
         hit, reciprocal_rank, best_rank = item
-        terms = set(re.findall(r"[a-z]+|\d+", hit.text.casefold()))
-        original_coverage = len(terms.intersection(original_terms)) / max(1, len(original_terms))
-        expanded_coverage = len(terms.intersection(expanded_terms)) / max(1, len(expanded_terms))
-        return -(reciprocal_rank * (1 + original_coverage + 0.5 * expanded_coverage)), best_rank
+        matched = set(re.findall(r"[a-z]+|\d+", hit.text.casefold()))
+        original_coverage = _weighted_coverage(set(original_terms), original_weights, matched)
+        expanded_coverage = _weighted_coverage(set(expanded_terms), expanded_weights, matched)
+        return -(reciprocal_rank * (1 + 2 * original_coverage + expanded_coverage)), best_rank
 
     ordered = sorted(candidates.values(), key=relevance)
     citations: list[MemoryCitation] = []
