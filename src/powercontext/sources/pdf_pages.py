@@ -84,16 +84,6 @@ _QUESTION_STOP_WORDS = frozenset([
     "with",
     "within",
 ])
-_QUERY_EXPANSIONS = (
-    ("geograph", "regions countries North America Europe Asia Latin America"),
-    ("legal", "litigation legal proceedings"),
-    ("restructuring", "restructuring charges impairment"),
-    ("ebitda", "operating income depreciation amortization"),
-    ("capex", "capital expenditures purchases property plant equipment"),
-    ("margin", "revenue net sales"),
-    ("cash flow", "statement of cash flows"),
-    ("income statement", "consolidated statements of income"),
-)
 
 
 class PDFDocumentInput(BaseModel):
@@ -223,15 +213,10 @@ def _citation(hit: MemoryHit) -> MemoryCitation:
     )
 
 
-def _query_terms(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    original = tuple(
+def _query_terms(question: str) -> tuple[str, ...]:
+    return tuple(
         dict.fromkeys(term for term in analyze_fts_query(question).split() if term not in _QUESTION_STOP_WORDS)
     )
-    lowered = question.casefold()
-    additions = tuple(
-        term for marker, expansion in _QUERY_EXPANSIONS if marker in lowered for term in expansion.split()
-    )
-    return original, tuple(dict.fromkeys((*original, *additions)))
 
 
 def _entity_terms(question: str) -> tuple[str, ...]:
@@ -283,10 +268,9 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         raise ValueError("limit must be a positive integer")
     if not question.strip():
         raise ValueError("question must not be blank")
-    original_terms, expanded_terms = _query_terms(question)
-    expanded_query = " ".join(expanded_terms)
+    query_terms = _query_terms(question)
     entity_query = " ".join(_entity_terms(question))
-    queries = tuple(dict.fromkeys(query for query in (question, expanded_query, entity_query) if query.strip()))
+    queries = tuple(dict.fromkeys(query for query in (question, entity_query) if query.strip()))
     candidates: dict[tuple[str, str, int, str, str], tuple[MemoryHit, float, int]] = {}
     candidate_limit = min(400, max(100, limit * 10))
     for query_index, query in enumerate(queries):
@@ -302,15 +286,13 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
                 candidates[key] = (hit, score, rank)
 
     documents = tuple(hit.text for hit, _, _ in candidates.values())
-    original_weights = _term_weights(documents, original_terms)
-    expanded_weights = _term_weights(documents, expanded_terms)
+    weights = _term_weights(documents, query_terms)
 
     def relevance(item) -> tuple[float, int]:
         hit, reciprocal_rank, best_rank = item
         matched = set(re.findall(r"[a-z]+|\d+", hit.text.casefold()))
-        original_coverage = _weighted_coverage(set(original_terms), original_weights, matched)
-        expanded_coverage = _weighted_coverage(set(expanded_terms), expanded_weights, matched)
-        return -(reciprocal_rank * (1 + 2 * original_coverage + expanded_coverage)), best_rank
+        coverage = _weighted_coverage(set(query_terms), weights, matched)
+        return -(reciprocal_rank * (1 + 3 * coverage)), best_rank
 
     ordered = sorted(candidates.values(), key=relevance)
     citations: list[MemoryCitation] = []
