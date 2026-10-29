@@ -96,6 +96,9 @@ _BM25_K1 = 1.2
 _BM25_B = 0.15
 _STATEMENT_WEIGHT = 1.6
 _CONCEPT_WEIGHT = 0.6
+_HEADING_CONCEPT_WEIGHT = 0.3
+_HEADING_LINES = 8
+_HEADING_CHARS = 220
 _FUSION_WEIGHT = 1e-6
 
 # A financial question usually names the statement that carries the answer, but the
@@ -417,6 +420,40 @@ def _concept_boost(texts: list[str], phrases: tuple[tuple[str, ...], ...]) -> li
     return boost
 
 
+def _page_heading(text: str) -> str:
+    """Return the lines a filing prints above its body text.
+
+    Every page leads with the run head and the title of the section it belongs to, which is
+    how a table or a note announces what it holds. The page body is where the answer sits,
+    but the title is what says the page is about the thing the question asks for.
+    """
+
+    body = text.split("\n", 1)[-1]
+    lines = [line.strip() for line in body.splitlines()[:_HEADING_LINES]]
+    kept = [line for line in lines if line and line.casefold() not in {"table of contents", "index"}]
+    return " ".join(kept)[:_HEADING_CHARS]
+
+
+def _heading_concept_boost(texts: list[str], phrases: tuple[tuple[str, ...], ...]) -> list[float]:
+    """Reward a page whose own title names the concept the question asks about.
+
+    Report phrases live in titles: a segment table is headed "Summary of Business Segment
+    Data" and a debt note "Note 7. Debt", while the question only ever says "product
+    categories" or "debt". Matching the concept against the page title separates the one
+    page that is about it from the pages that merely mention it in a sentence.
+    """
+
+    boost = [0.0] * len(texts)
+    if not phrases:
+        return boost
+    headings = [_page_heading(text).lower() for text in texts]
+    for group in phrases:
+        for index, heading in enumerate(headings):
+            if any(phrase in heading for phrase in group):
+                boost[index] += _HEADING_CONCEPT_WEIGHT
+    return boost
+
+
 def _rank_hits(
     question: str,
     candidates: dict[tuple[str, str, int, str, str], tuple[MemoryHit, float]],
@@ -435,10 +472,16 @@ def _rank_hits(
     lexical = _bm25_scores(question, texts)
     peak = max(lexical) or 1.0
     statement = _statement_boost(texts, _implied_statements(question))
-    concept = _concept_boost(texts, _implied_concepts(question))
+    concepts = _implied_concepts(question)
+    concept = _concept_boost(texts, concepts)
+    heading = _heading_concept_boost(texts, concepts)
     peak_fusion = max(fusion) or 1.0
     scored = [
-        lexical[index] / peak + statement[index] + concept[index] + _FUSION_WEIGHT * fusion[index] / peak_fusion
+        lexical[index] / peak
+        + statement[index]
+        + concept[index]
+        + heading[index]
+        + _FUSION_WEIGHT * fusion[index] / peak_fusion
         for index in range(len(hits))
     ]
     return [hit for _, hit in sorted(zip(scored, hits, strict=True), key=lambda item: -item[0])]
