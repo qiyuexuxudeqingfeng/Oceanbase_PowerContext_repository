@@ -884,15 +884,28 @@ def _literal_evidence_segments(text: str) -> list[tuple[int, int, str]]:
     return segments
 
 
+_MAX_EVIDENCE_FRAGMENTS = 6
+
+
 def _select_evidence_fragments(  # noqa: C901
     request: PrepareContextRequest,
     current_scope_id: str | None,
     groups: Sequence[PreparedMemoryCandidates],
 ) -> tuple[PreparedContextFragment, ...]:
+    """Choose the literal fragments that carry the query's evidence inside the byte budget.
+
+    Every delivered fragment pays a fixed citation block - scope, memory reference, entry
+    and version ids, offsets - on top of its own text, so a budget split across many short
+    fragments is mostly citation.  The selection therefore grows a few contiguous windows
+    around the best matching sentences instead of scattering single sentences, which keeps
+    markedly more source text inside the same number of bytes.
+    """
     query_terms = set(_evidence_terms(request.query))
     if not query_terms:
         return ()
-    entries: list[tuple[PreparedContextFragment, Counter[str], str, float]] = []
+    phrase = " ".join(re.findall(r"[a-z]+|\d+", request.query.casefold()))
+
+    entries: list[list[object]] = []
     frequencies: Counter[str] = Counter()
     for group in groups:
         if group.hits and group.memory_ref is None:
@@ -906,100 +919,82 @@ def _select_evidence_fragments(  # noqa: C901
                 entry_id=hit.entry_id,
                 entry_version_id=hit.entry_version_id,
             )
+            segments: list[tuple[int, int, str, Counter[str]]] = []
             for start, end, text in _literal_evidence_segments(hit.text):
                 terms = Counter(_evidence_terms(text))
                 if not terms:
                     continue
                 frequencies.update(terms.keys())
-                entries.append((PreparedContextFragment(address, start, end, text), terms, text.casefold(), hit.score))
+                segments.append((start, end, text, terms))
+            if segments:
+                entries.append([address, hit.text, float(hit.score), segments])
 
-    ranked: list[tuple[float, float, PreparedContextFragment]] = []
-    for fragment, terms, folded, hit_score in entries:
-        overlap = query_terms.intersection(terms)
-        if not overlap:
-            continue
-        score = sum(
-            (1 + math.log(terms[term])) * math.log(1 + len(entries) / (1 + frequencies[term])) for term in overlap
-        )
-        score += 2 * len(overlap) / len(query_terms)
-        phrase = " ".join(re.findall(r"[a-z]+|\d+", request.query.casefold()))
-        if len(phrase) > 3 and phrase in " ".join(re.findall(r"[a-z]+|\d+", folded)):
-            score += 2
-        ranked.append((score, hit_score, fragment))
-    ranked.sort(
-        key=lambda item: (
-            -item[0],
-            -item[1],
-            item[2].address.memory.scope_id,
-            item[2].address.memory.artifact.artifact_id,
-            item[2].start,
-        )
-    )
-
-    selected: list[PreparedContextFragment] = []
-    per_entry: Counter[tuple[str, str, int, str, str]] = Counter()
-    for _, _, fragment in ranked:
-        if len(selected) >= 8:
-            break
-        address = fragment.address
-        key = (
-            address.memory.scope_id,
-            address.memory.artifact.artifact_id,
-            address.memory.artifact.revision,
-            address.entry_id,
-            address.entry_version_id,
-        )
-        if per_entry[key] >= 4:
-            continue
-        fitted = _fit_evidence_fragment(fragment, selected, request.max_bytes, query_terms)
-        if fitted is None:
-            continue
-        selected.append(fitted)
-        per_entry[key] += 1
-    return tuple(selected)
-
-
-def _fit_evidence_fragment(
-    fragment: PreparedContextFragment,
-    selected: Sequence[PreparedContextFragment],
-    max_bytes: int,
-    query_terms: set[str],
-) -> PreparedContextFragment | None:
-    if len(_render_evidence_fragments((*selected, fragment)).encode("utf-8")) <= max_bytes:
-        return fragment
-    text = fragment.text
-    raw_terms = [term for term in re.findall(r"[a-z]+|\d+", text.casefold()) if len(term) > 2]
-    positions = [
-        match.start()
-        for term in raw_terms
-        if (match := re.search(rf"\b{re.escape(term)}\b", text, re.IGNORECASE)) is not None
-    ]
-    center = positions[0] if positions else len(text) // 2
-    best: PreparedContextFragment | None = None
-    lower, upper = 1, len(text)
-    while lower <= upper:
-        size = (lower + upper) // 2
-        start = max(0, min(center - size // 2, len(text) - size))
-        end = start + size
-        span = _trim_evidence_span(text, start, end)
-        if span is not None:
-            candidate = PreparedContextFragment(
-                address=fragment.address,
-                start=fragment.start + span[0],
-                end=fragment.start + span[1],
-                text=text[span[0] : span[1]],
+    total_segments = sum(len(entry[3]) for entry in entries) or 1
+    scores: list[list[float]] = []
+    seeds: list[tuple[float, int, int]] = []
+    for entry_index, entry in enumerate(entries):
+        rows: list[float] = []
+        for segment_index, (_, _, _, terms) in enumerate(entry[3]):
+            overlap = query_terms.intersection(terms)
+            if not overlap:
+                rows.append(0.0)
+                continue
+            score = sum(
+                (1 + math.log(terms[term])) * math.log(1 + total_segments / (1 + frequencies[term])) for term in overlap
             )
-            if (
-                query_terms.intersection(_evidence_terms(candidate.text))
-                and len(_render_evidence_fragments((*selected, candidate)).encode("utf-8")) <= max_bytes
-            ):
-                best = candidate
-                lower = size + 1
-            else:
-                upper = size - 1
-        else:
-            upper = size - 1
-    return best
+            score += 2 * len(overlap) / len(query_terms)
+            if len(phrase) > 3 and phrase in entry[3][segment_index][2].casefold():
+                score += 2
+            rows.append(score)
+            seeds.append((score, entry_index, segment_index))
+        scores.append(rows)
+    seeds.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    def fragment_for(window: Sequence[int]) -> PreparedContextFragment:
+        entry_index, first, last = window
+        address, text, _, segments = entries[entry_index]
+        start = segments[first][0]
+        end = segments[last][1]
+        return PreparedContextFragment(address, start, end, text[start:end])
+
+    def fragments_for(windows: Sequence[Sequence[int]]) -> tuple[PreparedContextFragment, ...]:
+        return tuple(fragment_for(window) for window in windows)
+
+    def byte_size(fragments: Sequence[PreparedContextFragment]) -> int:
+        return len(_render_evidence_fragments(fragments).encode("utf-8"))
+
+    windows: list[list[int]] = []
+    used: set[tuple[int, int]] = set()
+    for _, entry_index, segment_index in seeds:
+        if len(windows) >= _MAX_EVIDENCE_FRAGMENTS:
+            break
+        if (entry_index, segment_index) in used:
+            continue
+        segments = entries[entry_index][3]
+        window = [entry_index, segment_index, segment_index]
+        if byte_size(fragments_for([*windows, window])) > request.max_bytes:
+            continue
+        used.add((entry_index, segment_index))
+        while True:
+            options = [
+                (scores[entry_index][candidate], candidate)
+                for candidate in (window[1] - 1, window[2] + 1)
+                if 0 <= candidate < len(segments) and (entry_index, candidate) not in used
+            ]
+            options.sort(key=lambda item: (-item[0], item[1]))
+            grown = False
+            for _, candidate in options:
+                trial = [entry_index, min(window[1], candidate), max(window[2], candidate)]
+                if byte_size(fragments_for([*windows, trial])) > request.max_bytes:
+                    continue
+                used.add((entry_index, candidate))
+                window = trial
+                grown = True
+                break
+            if not grown:
+                break
+        windows.append(window)
+    return fragments_for(windows)
 
 
 def _render_evidence_fragments(fragments: Sequence[PreparedContextFragment]) -> str:
